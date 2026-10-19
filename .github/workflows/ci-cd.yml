@@ -1,0 +1,145 @@
+name: emr-spark-ci-cd
+
+on:
+  pull_request:
+    branches: [main]        # PRs: tests only (no AWS cost)
+  push:
+    branches: [main]        # main: test -> build -> dev -> (approval) -> prod
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emr-cicd-${{ github.ref }}
+  cancel-in-progress: false  # never kill a running deploy mid-way
+
+env:
+  AWS_REGION: ${{ vars.AWS_REGION }}
+
+jobs:
+  # ---------------- 1. CI: unit tests with pytest + local Spark ----------------
+  test:
+    name: 1. Unit tests (pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: Run pytest
+        run: |
+          mkdir -p reports
+          pytest --junitxml=reports/junit.xml \
+                 --cov=sales_pipeline --cov=main \
+                 --cov-report=term-missing --cov-report=xml:reports/coverage.xml \
+                 --cov-fail-under=80
+      - name: Test summary
+        if: always()
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import xml.etree.ElementTree as ET
+          r = ET.parse("reports/junit.xml").getroot()
+          s = r if r.tag == "testsuite" else r.find("testsuite")
+          print("### pytest results\n| tests | failures | errors | skipped | time (s) |\n|---|---|---|---|---|")
+          print(f"| {s.get('tests')} | {s.get('failures')} | {s.get('errors')} | {s.get('skipped')} | {s.get('time')} |")
+          EOF
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: test-reports
+          path: reports/
+          retention-days: 3
+
+  # ---------------- 2. Build: package the Spark job once ----------------
+  build:
+    name: 2. Package Spark job
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build bundle
+        run: |
+          mkdir -p dist
+          (cd src && zip -r ../dist/sales_pipeline.zip sales_pipeline -x '*__pycache__*')
+          cp src/main.py dist/main.py
+          ls -l dist
+      - uses: actions/upload-artifact@v5
+        with:
+          name: emr-bundle
+          path: dist/
+          retention-days: 3
+
+  # ---------------- 3. CD: deploy + run on DEV (automatic) ----------------
+  deploy-dev:
+    name: 3. Deploy & run on EMR (dev)
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: dev
+    permissions:
+      id-token: write   # OIDC -> AWS, no static keys
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: emr-bundle
+          path: dist
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-${{ github.run_id }}-dev
+      - name: Upload artifacts + sample data to S3
+        run: |
+          aws s3 cp dist/ "s3://${{ vars.S3_BUCKET }}/artifacts/${GITHUB_SHA}/" --recursive
+          aws s3 cp data/sales.csv "s3://${{ vars.S3_BUCKET }}/data/sales.csv"
+      - name: Run Spark job on EMR Serverless
+        id: run
+        env:
+          ENV_NAME: dev
+          EMR_APP_ID: ${{ vars.EMR_APP_ID }}
+          EMR_JOB_ROLE_ARN: ${{ vars.EMR_JOB_ROLE_ARN }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+        run: bash scripts/run_emr_job.sh
+
+  # ---------------- 4. CD: PROD (pauses for manual approval) ----------------
+  deploy-prod:
+    name: 4. Deploy & run on EMR (prod) - needs approval
+    needs: deploy-dev
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: prod        # 'Required reviewers' on this environment = interactive approval gate
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gh-${{ github.run_id }}-prod
+      - name: Verify promoted artifact exists (same build as dev)
+        run: aws s3 ls "s3://${{ vars.S3_BUCKET }}/artifacts/${GITHUB_SHA}/main.py"
+      - name: Run Spark job on EMR Serverless
+        id: run
+        env:
+          ENV_NAME: prod
+          EMR_APP_ID: ${{ vars.EMR_APP_ID }}
+          EMR_JOB_ROLE_ARN: ${{ vars.EMR_JOB_ROLE_ARN }}
+          S3_BUCKET: ${{ vars.S3_BUCKET }}
+        run: bash scripts/run_emr_job.sh

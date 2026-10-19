@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EMR Serverless Spark CI/CD demo - S3 bucket, EMR Serverless application
+  (auto-start/auto-stop, capped capacity, ARM64), job execution role and a
+  GitHub Actions OIDC deploy role scoped to the dev/prod environments.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Description: GitHub user or organisation that owns the repo
+  GitHubRepo:
+    Type: String
+    Description: GitHub repository name (without owner)
+  CreateOidcProvider:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Set to false if token.actions.githubusercontent.com already exists in this account
+  ReleaseLabel:
+    Type: String
+    Default: emr-7.13.0
+  ProjectName:
+    Type: String
+    Default: emr-cicd-demo
+    AllowedPattern: "[a-z0-9-]+"
+
+Conditions:
+  CreateOidc: !Equals [!Ref CreateOidcProvider, "true"]
+
+Resources:
+  # ---------- GitHub OIDC (no long-lived AWS keys in GitHub) ----------
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidc
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+
+  # ---------- Storage: artifacts, data, output, logs ----------
+  DemoBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-demo-objects # min cost: nothing lingers
+            Status: Enabled
+            ExpirationInDays: 7
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+
+  DemoBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DemoBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt DemoBucket.Arn
+              - !Sub "${DemoBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ---------- EMR Serverless (pay only while a job runs) ----------
+  SparkApp:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: !Sub "${ProjectName}-spark"
+      ReleaseLabel: !Ref ReleaseLabel
+      Type: SPARK
+      Architecture: ARM64 # Graviton: lower per vCPU/GB-hour price
+      AutoStartConfiguration:
+        Enabled: true
+      AutoStopConfiguration:
+        Enabled: true
+        IdleTimeoutMinutes: 1 # stop billing ASAP after jobs finish
+      MaximumCapacity: # hard cost ceiling for the whole app
+        Cpu: 4 vCPU
+        Memory: 16 GB
+        Disk: 80 GB
+      # No InitialCapacity => no pre-initialised (always-billed) workers
+
+  # ---------- Role assumed by the Spark job ----------
+  EmrJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-emr-job-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: emr-serverless.amazonaws.com
+            Action: sts:AssumeRole
+            Condition: # confused-deputy protection
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub "arn:${AWS::Partition}:emr-serverless:${AWS::Region}:${AWS::AccountId}:/applications/*"
+      Policies:
+        - PolicyName: s3-demo-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:ListBucket, s3:GetBucketLocation]
+                Resource: !GetAtt DemoBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub "${DemoBucket.Arn}/*"
+
+  # ---------- Role assumed by GitHub Actions (dev/prod environments only) ----------
+  GitHubDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-deploy-role"
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidc
+                - !Ref GitHubOidcProvider
+                - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:dev"
+                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:prod"
+      Policies:
+        - PolicyName: deploy-and-run
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BucketList
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt DemoBucket.Arn
+              - Sid: BucketObjects
+                Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "${DemoBucket.Arn}/*"
+              - Sid: RunSparkJobs
+                Effect: Allow
+                Action:
+                  - emr-serverless:GetApplication
+                  - emr-serverless:StartApplication
+                  - emr-serverless:StartJobRun
+                  - emr-serverless:GetJobRun
+                  - emr-serverless:CancelJobRun
+                  - emr-serverless:GetDashboardForJobRun
+                  - emr-serverless:TagResource
+                Resource:
+                  - !GetAtt SparkApp.Arn
+                  - !Sub "${SparkApp.Arn}/jobruns/*"
+              - Sid: PassOnlyJobRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt EmrJobRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: emr-serverless.amazonaws.com
+
+Outputs:
+  S3Bucket:
+    Value: !Ref DemoBucket
+  EmrAppId:
+    Value: !GetAtt SparkApp.ApplicationId
+  EmrJobRoleArn:
+    Value: !GetAtt EmrJobRole.Arn
+  GitHubRoleArn:
+    Value: !GetAtt GitHubDeployRole.Arn

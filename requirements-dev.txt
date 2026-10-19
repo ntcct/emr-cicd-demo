@@ -1,0 +1,4 @@
+# Match Spark 3.5.x shipped with EMR 7.x
+pyspark==3.5.5
+pytest==8.4.2
+pytest-cov==6.2.1

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+coverage.xml
+reports/
+dist/
+spark-warehouse/
+metastore_db/
+derby.log
