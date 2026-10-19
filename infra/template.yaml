@@ -11,6 +11,14 @@ Parameters:
   GitHubRepo:
     Type: String
     Description: GitHub repository name (without owner)
+  GitHubSubjectPrefix:
+    Type: String
+    Default: ""
+    Description: >
+      OIDC 'sub' prefix. Leave empty for legacy 'repo:<org>/<repo>'. For repos using
+      immutable subjects, set to the value of
+      'gh api repos/<org>/<repo>/actions/oidc/customization/sub --jq .sub_claim_prefix'
+      (e.g. repo:owner@123/repo@456).
   CreateOidcProvider:
     Type: String
     AllowedValues: ["true", "false"]
@@ -26,6 +34,7 @@ Parameters:
 
 Conditions:
   CreateOidc: !Equals [!Ref CreateOidcProvider, "true"]
+  LegacySubject: !Equals [!Ref GitHubSubjectPrefix, ""]
 
 Resources:
   # ---------- GitHub OIDC (no long-lived AWS keys in GitHub) ----------
@@ -146,12 +155,15 @@ Resources:
                 - !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com"
             Action: sts:AssumeRoleWithWebIdentity
             Condition:
-              StringEquals:
+              StringEquals: # exact match, only the dev/prod environments of this repo
                 token.actions.githubusercontent.com:aud: sts.amazonaws.com
-              StringLike:
                 token.actions.githubusercontent.com:sub:
-                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:dev"
-                  - !Sub "repo:${GitHubOrg}/${GitHubRepo}:environment:prod"
+                  - !Sub
+                    - "${Prefix}:environment:dev"
+                    - Prefix: !If [LegacySubject, !Sub "repo:${GitHubOrg}/${GitHubRepo}", !Ref GitHubSubjectPrefix]
+                  - !Sub
+                    - "${Prefix}:environment:prod"
+                    - Prefix: !If [LegacySubject, !Sub "repo:${GitHubOrg}/${GitHubRepo}", !Ref GitHubSubjectPrefix]
       Policies:
         - PolicyName: deploy-and-run
           PolicyDocument:

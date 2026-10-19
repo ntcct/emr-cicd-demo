@@ -86,9 +86,11 @@ $env:PYSPARK_PYTHON = (Resolve-Path .venv\Scripts\python.exe).Path
 
 # --- deploy infra ---
 $REGION="us-east-1"; $ORG="<github-owner>"; $REPO="<repo-name>"
+# Newer repos use immutable OIDC subjects (repo:owner@id/repo@id) - read the real prefix after creating the repo:
+$SUB = gh api "repos/$ORG/$REPO/actions/oidc/customization/sub" --jq .sub_claim_prefix
 aws cloudformation deploy --region $REGION --stack-name emr-cicd-demo `
   --template-file infra/template.yaml --capabilities CAPABILITY_NAMED_IAM `
-  --parameter-overrides GitHubOrg=$ORG GitHubRepo=$REPO CreateOidcProvider=true
+  --parameter-overrides GitHubOrg=$ORG GitHubRepo=$REPO CreateOidcProvider=true "GitHubSubjectPrefix=$SUB"
 aws cloudformation describe-stacks --region $REGION --stack-name emr-cicd-demo `
   --query "Stacks[0].Outputs" --output table
 
